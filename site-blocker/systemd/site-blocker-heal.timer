@@ -1,0 +1,10 @@
+[Unit]
+Description=Check site-blocker allow windows every minute (also after boot)
+
+[Timer]
+OnActiveSec=20s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

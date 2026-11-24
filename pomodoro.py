@@ -318,9 +318,14 @@ def cmd_start(cfg: dict[str, Any]) -> None:
 def cmd_pause(cfg: dict[str, Any]) -> None:
     state = load_state(cfg)
     if state["running"]:
-        state["remaining"] = max(0, math.ceil(state["end_at"] - time.time()))
-        state["running"] = False
-        state["end_at"] = 0
+        # Deadline may have passed between daemon ticks; complete the session
+        # instead of leaving it stuck paused at 00:00.
+        if state["end_at"] and time.time() >= state["end_at"]:
+            advance(state, cfg, count=True)
+        else:
+            state["remaining"] = max(0, math.ceil(state["end_at"] - time.time()))
+            state["running"] = False
+            state["end_at"] = 0
         save_state(state)
     status(cfg)
 

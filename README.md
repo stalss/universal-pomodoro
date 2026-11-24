@@ -134,13 +134,24 @@ Every `reward_sessions`-th completed focus session runs `reward_command`.
 `{minutes}` is replaced with `reward_minutes`. Examples:
 
 ```bash
-# site-blocker (as in the Omarchy plugin)
+# site-blocker (setup included in site-blocker/)
 pomodoro config reward_command 'sudo -n /usr/local/bin/site-blocker pause {minutes}'
 pomodoro config restore_command 'sudo -n /usr/local/bin/site-blocker resume'
 
 # Or anything else: a firewall rule, a script, a reminder...
 pomodoro config reward_command '~/bin/unblock-distractions {minutes}'
 ```
+
+If you use site-blocker, install it first or the reward command will fail:
+
+```bash
+cd site-blocker
+chmod +x install-site-blocker.sh
+sudo ./install-site-blocker.sh "$USER"
+```
+
+See [`site-blocker/README.md`](site-blocker/README.md) for requirements
+(NetworkManager + dnsmasq, passwordless sudo) and verification steps.
 
 Leave both commands empty (the default) to disable the reward entirely — the
 timer still counts sessions and shows progress.

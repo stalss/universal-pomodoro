@@ -1,0 +1,8 @@
+[Unit]
+Description=Restore expired site-blocker reward pause windows
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/site-blocker heal

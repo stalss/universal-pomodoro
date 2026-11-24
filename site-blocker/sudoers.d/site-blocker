@@ -1,0 +1,4 @@
+# Passwordless permission for the Pomodoro reward integration.
+# The installer replaces USERNAME with the invoking user. Never edit this
+# file directly — use `visudo -cf` to validate before installing.
+USERNAME ALL=(root) NOPASSWD: /usr/local/bin/site-blocker pause *, /usr/local/bin/site-blocker resume

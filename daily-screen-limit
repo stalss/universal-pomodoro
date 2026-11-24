@@ -69,17 +69,24 @@ def session_id() -> str | None:
         ).stdout
     except OSError:
         return None
+    fallback = None
     for line in out.splitlines():
         candidate = line.split()[0] if line.split() else ""
         if not candidate.isdigit():
             continue
         info = subprocess.run(
-            ["loginctl", "show-session", candidate, "-p", "Class", "-p", "Active", "--value"],
+            ["loginctl", "show-session", candidate,
+             "-p", "Class", "-p", "Active", "-p", "Type", "--value"],
             capture_output=True, text=True, check=False,
         ).stdout.split()
         if "user" in info and "yes" in info:
-            return candidate
-    return None
+            # Prefer the graphical session; keep any active user session as a
+            # fallback so a secondary text session doesn't get terminated.
+            if "wayland" in info or "x11" in info:
+                return candidate
+            if fallback is None:
+                fallback = candidate
+    return fallback
 
 
 def locked_hint(sid: str) -> bool | None:
@@ -99,14 +106,25 @@ def locked_hint(sid: str) -> bool | None:
 
 
 def notify(title: str, message: str) -> None:
-    subprocess.run(
-        ["notify-send", "-a", "Daily screen limit", title, message],
-        capture_output=True, check=False,
-    )
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "Daily screen limit", title, message],
+            capture_output=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass  # no notification daemon in this environment
 
 
 def today() -> str:
     return dt.datetime.now().astimezone().strftime("%Y-%m-%d")
+
+
+def safe_int(value: object, default: int = 0) -> int:
+    """Parse an int from untrusted JSON without letting a bad value abort a tick."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def load_state() -> dict:
@@ -119,7 +137,7 @@ def load_state() -> dict:
     last = data.get("last")
     return {
         "date": today(),
-        "seconds": max(0, int(data.get("seconds", 0) or 0)),
+        "seconds": max(0, safe_int(data.get("seconds", 0))),
         "warned": bool(data.get("warned", False)),
         "last": last if isinstance(last, (int, float)) else int(time.time()),
     }

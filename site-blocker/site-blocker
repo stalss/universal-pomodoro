@@ -1,0 +1,1062 @@
+#!/usr/bin/env python3
+"""site-blocker - system-wide DNS blocklist for distracting sites.
+
+Blocks porn, social media, gambling and browser-game domains through
+NetworkManager's dnsmasq resolver.  Blocks whole domains *and* their
+subdomains, so www./m./cdn.* are covered by a single entry.
+
+Commands:
+  site-blocker update     download fresh lists, rebuild, reload DNS
+  site-blocker apply      rebuild from cached lists, reload DNS
+  site-blocker pause [M]  lift blocking for M minutes (default 120, max 480)
+  site-blocker resume     restore blocking immediately
+  site-blocker paused     show pause state
+  site-blocker heal       restore expired allow windows (boot watchdog)
+  site-blocker status     show block count and test some domains
+  site-blocker allow D..  allow a domain (and its subdomains)
+  site-blocker block D..  block an extra domain (and its subdomains)
+  site-blocker uninstall  remove everything and restore systemd-resolved
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+STATE_DIR = Path("/var/lib/site-blocker")
+CONF = Path("/etc/NetworkManager/dnsmasq.d/99-site-blocker.conf")
+SAFESEARCH_CONF = Path("/etc/NetworkManager/dnsmasq.d/99-site-blocker-safesearch.conf")
+SAFESEARCH_IP = "216.239.38.120"
+SAFESEARCH_HOSTS = [
+    "www.google.com",
+    "www.google.co.in",
+    "www.google.co.uk",
+    "www.google.ca",
+    "www.google.com.au",
+    "www.google.de",
+    "www.google.fr",
+    "www.google.es",
+    "www.google.it",
+    "www.google.co.jp",
+    "www.google.com.br",
+    "www.google.com.mx",
+    "www.google.co.za",
+    "www.google.ae",
+    "www.google.com.sa",
+    "www.google.com.sg",
+    "www.google.com.pk",
+    "www.google.com.bd",
+    "www.google.com.np",
+    "www.google.lk",
+    "www.google.pt",
+    "www.google.nl",
+    "www.google.se",
+    "www.google.ch",
+    "www.google.at",
+    "www.google.ie",
+    "www.google.co.nz",
+    "www.google.com.ph",
+    "www.google.co.id",
+    "www.google.com.my",
+    "www.google.co.th",
+    "www.google.com.vn",
+    "www.google.com.ar",
+    "www.google.cl",
+    "www.google.com.co",
+    "www.google.com.pe",
+    "www.google.com.eg",
+    "www.google.com.ng",
+    "www.google.co.ke",
+    "www.google.com.gh",
+    "www.google.com.tr",
+    "www.google.com.ua",
+]
+NM_CONF = Path("/etc/NetworkManager/conf.d/99-site-blocker.conf")
+CONF_DIR = Path("/etc/site-blocker")
+ALLOW_FILE = CONF_DIR / "allow.txt"
+EXTRA_FILE = CONF_DIR / "block.txt"
+SELF = Path("/usr/local/bin/site-blocker")
+PAUSED_CONF = STATE_DIR / "99-site-blocker.conf.paused"
+PAUSE_JSON = STATE_DIR / "pause.json"
+RESUME_UNIT = "site-blocker-resume"
+PAUSE_DEFAULT_MIN = 120
+PAUSE_MAX_MIN = 480
+ZEN_POLICY = Path("/opt/zen-browser-bin/distribution/policies.json")
+FIREFOX_POLICY = Path("/etc/firefox/policies/policies.json")
+PACMAN_HOOK = Path("/etc/pacman.d/hooks/99-site-blocker-zen.hook")
+SERVICE = Path("/etc/systemd/system/site-blocker.service")
+TIMER = Path("/etc/systemd/system/site-blocker.timer")
+
+SOURCES = [
+    (
+        "porn",
+        "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts",
+    ),
+    (
+        "social",
+        "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social-only/hosts",
+    ),
+    (
+        "gambling",
+        "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling-only/hosts",
+    ),
+    (
+        "nsfw-oisd",
+        "https://nsfw.oisd.nl/domainswild",
+    ),
+]
+
+# Never blocked.  Domains that must keep working (exact domain + all subdomains).
+DEFAULT_ALLOW = """# Domains allowed through the blocklist (exact domain + all subdomains).
+# One domain per line. Run: sudo site-blocker apply
+yt.be
+ggpht.com
+googleusercontent.com
+gstatic.com
+googleapis.com
+google.com
+
+discord.com
+discord.gg
+discordapp.com
+discordapp.net
+discord.media
+discordcdn.com
+discord.co
+discordstatus.com
+
+whatsapp.com
+whatsapp.net
+wa.me
+whatsapp.org
+whatsappbrand.com
+
+pw.live
+pwskills.com
+pwonlyias.com
+pwlive.com
+pwlive.in
+
+# Local / system names
+localhost
+local
+lan
+home.arpa
+arpa
+invalid
+test
+"""
+
+# Extra domains that the lists above do not always cover.
+DEFAULT_EXTRA = """# Extra domains to block (exact domain + all subdomains).
+
+# --- social media ---
+instagram.com
+cdninstagram.com
+instagr.am
+ig.me
+facebook.com
+facebook.net
+fb.com
+fb.me
+fb.watch
+fbsbx.com
+messenger.com
+m.me
+threads.net
+threads.com
+twitter.com
+x.com
+tiktok.com
+tiktokcdn.com
+tiktokv.com
+snapchat.com
+reddit.com
+redd.it
+redditmedia.com
+redditstatic.com
+pinterest.com
+pinimg.com
+tumblr.com
+linkedin.com
+licdn.com
+twitch.tv
+ttvnw.net
+bereal.com
+
+# --- browser games / game portals ---
+poki.com
+crazygames.com
+y8.com
+friv.com
+miniclip.com
+coolmathgames.com
+coolmath.com
+silvergames.com
+kongregate.com
+armorgames.com
+newgrounds.com
+addictinggames.com
+gamesgames.com
+plays.org
+gamepix.com
+lagged.com
+pogo.com
+html5games.com
+kbhgames.com
+gogy.com
+kizi.com
+gameflare.com
+now.gg
+itch.io
+roblox.com
+
+# --- .io / browser games ---
+agar.io
+slither.io
+diep.io
+surviv.io
+krunker.io
+shellshock.io
+1v1.lol
+bloxd.io
+zombsroyale.io
+skribbl.io
+garticphone.com
+jklm.fun
+neal.fun
+ev.io
+hole.io
+paper-io.com
+wormate.io
+splix.io
+moomoo.io
+starve.io
+mope.io
+zombs.io
+lordz.io
+voxiom.io
+miniroyale.io
+kirka.io
+venge.io
+rbxcdn.com
+agame.com
+gamedistribution.com
+gamemonetize.com
+playhop.com
+snokido.com
+gamaverse.com
+gamezhero.com
+freeonlinegames.com
+yiv.com
+"""
+
+# Shared infrastructure that must never be blocked, even if a list is wrong.
+BROAD_ROOTS = {
+    "amazonaws.com",
+    "akamaihd.net",
+    "akamaized.net",
+    "azureedge.net",
+    "blogspot.com",
+    "cloudflare.com",
+    "cloudflare.net",
+    "cloudfront.net",
+    "fastly.net",
+    "firebaseapp.com",
+    "github.io",
+    "gitlab.io",
+    "glitch.me",
+    "googleapis.com",
+    "googleusercontent.com",
+    "gstatic.com",
+    "herokuapp.com",
+    "netlify.app",
+    "pages.dev",
+    "r2.dev",
+    "replit.dev",
+    "sharepoint.com",
+    "vercel.app",
+    "web.app",
+    "weebly.com",
+    "wixsite.com",
+    "wordpress.com",
+    "workers.dev",
+}
+
+IP_TOKENS = {"0.0.0.0", "127.0.0.1", "::", "::1", "0:0:0:0:0:0:0:1"}
+LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+IP_RE = re.compile(r"^[0-9a-f:.]+$")
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"site-blocker: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def need_root() -> None:
+    if os.geteuid() != 0:
+        die("must run as root (use sudo)")
+
+
+def read_lines(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    out = []
+    with path.open(encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            out.append(line.split("#", 1)[0].strip())
+    return [x for x in out if x]
+
+
+def valid_domain(d: str) -> bool:
+    if not d or len(d) > 253 or "_" in d:
+        return False
+    labels = d.split(".")
+    if len(labels) < 2 or not all(LABEL_RE.match(lbl) for lbl in labels):
+        return False
+    return True
+
+
+def is_ip(token: str) -> bool:
+    if token in IP_TOKENS:
+        return True
+    if not IP_RE.match(token):
+        return False
+    try:
+        ipaddress.ip_address(token)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_domain_list(path: Path):
+    """Yield domains from hosts-file, plain-domain or wildcard lists."""
+    with path.open(encoding="utf-8", errors="ignore") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and is_ip(parts[0]):
+                token = parts[1]
+            elif is_ip(parts[0]):
+                continue
+            else:
+                token = parts[0]
+            token = token.strip().lower().rstrip(".")
+            if token.startswith("*."):
+                token = token[2:]
+            if token.startswith("||"):
+                token = token[2:].split("^", 1)[0]
+            token = token.rstrip(".")
+            if token and "/" not in token and valid_domain(token):
+                yield token
+
+
+def blocked_by_suffix(domain: str, roots: set[str]) -> bool:
+    if domain in roots:
+        return True
+    return any(domain.endswith("." + r) for r in roots)
+
+
+def ensure_defaults() -> None:
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    if not ALLOW_FILE.exists():
+        ALLOW_FILE.write_text(DEFAULT_ALLOW, encoding="utf-8")
+    if not EXTRA_FILE.exists():
+        EXTRA_FILE.write_text(DEFAULT_EXTRA, encoding="utf-8")
+
+
+def download(name: str, url: str) -> Path | None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = STATE_DIR / f"{name}.txt"
+    tmp = STATE_DIR / f".{name}.tmp"
+    print(f"  fetching {name} ...", end="", flush=True)
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "site-blocker/1.0 (+local DNS filter)"}
+        )
+        with urllib.request.urlopen(req, timeout=600) as resp, tmp.open("wb") as out:
+            shutil.copyfileobj(resp, out, 256 * 1024)
+        os.replace(tmp, dest)
+        print(f" {dest.stat().st_size // 1024} KiB")
+        return dest
+    except Exception as exc:  # noqa: BLE001
+        tmp.unlink(missing_ok=True)
+        if dest.exists():
+            print(f" failed ({exc}); using cached copy")
+            return dest
+        print(f" failed ({exc}); skipped")
+        return None
+
+
+def build() -> int:
+    ensure_defaults()
+    heal_expired_pause()
+    allow_roots = {
+        d.lower()
+        for d in read_lines(ALLOW_FILE)
+        if re.fullmatch(r"[a-z0-9.-]+", d.lower())
+    }
+
+    domains: set[str] = set()
+    for name, url in SOURCES:
+        src = STATE_DIR / f"{name}.txt"
+        if not src.exists():
+            print(f"  no cached list for {name}, skipping (run: sudo site-blocker update)")
+            continue
+        before = len(domains)
+        for d in parse_domain_list(src):
+            domains.add(d)
+        print(f"  {name}: +{len(domains) - before:,} domains")
+
+    extras = [d.lower() for d in read_lines(EXTRA_FILE)]
+    valid_extras = {d for d in extras if valid_domain(d)}
+    domains |= valid_extras
+    print(f"  extra: +{len(valid_extras):,} domains")
+
+    blocked = sorted(
+        d
+        for d in domains
+        if not blocked_by_suffix(d, allow_roots) and d not in BROAD_ROOTS
+    )
+
+    # While a pause is active the new list is parked next to the paused one so
+    # the weekly refresh cannot re-block mid-window.
+    paused = pause_active()
+    if paused:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        target = PAUSED_CONF
+        tmp = STATE_DIR / ".99-site-blocker.conf.tmp"
+    else:
+        CONF.parent.mkdir(parents=True, exist_ok=True)
+        target = CONF
+        tmp = CONF.with_suffix(".tmp")
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write("# Managed by /usr/local/bin/site-blocker -- do not edit.\n")
+        fh.write(f"# Generated: {stamp}\n")
+        fh.write(f"# Blocked domains: {len(blocked):,}\n")
+        for d in blocked:
+            fh.write(f"local=/{d}/\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, target)
+
+    KB = target.stat().st_size // 1024
+    print(f"\n  blocked domains: {len(blocked):,}")
+    print(f"  config: {target} ({KB} KiB)" + ("  [paused]" if paused else ""))
+    write_safesearch()
+    return len(blocked)
+
+
+def write_safesearch() -> None:
+    """Lock Google SafeSearch on for all common Google country domains."""
+    tmp = SAFESEARCH_CONF.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write("# Managed by /usr/local/bin/site-blocker -- do not edit.\n")
+        fh.write("# Forces Google SafeSearch (filters explicit search results).\n")
+        for host in SAFESEARCH_HOSTS:
+            fh.write(f"address=/{host}/{SAFESEARCH_IP}\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, SAFESEARCH_CONF)
+    print(f"  SafeSearch locked: {len(SAFESEARCH_HOSTS)} Google domains")
+
+
+def write_doh_policies() -> None:
+    """Force DNS-over-HTTPS off so browsers cannot bypass the system resolver."""
+    dns_policy = {"DNSOverHTTPS": {"Enabled": False, "Locked": True}}
+
+    def merge(path: Path, base: dict) -> None:
+        data = base
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                data = base
+        data.setdefault("policies", {}).update(dns_policy)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        print(f"  DoH locked off: {path}")
+
+    if ZEN_POLICY.parent.exists():
+        merge(ZEN_POLICY, {"policies": {"DisableAppUpdate": True}})
+    merge(
+        FIREFOX_POLICY,
+        {"policies": {}},
+    )
+
+
+def write_pacman_hook() -> None:
+    PACMAN_HOOK.parent.mkdir(parents=True, exist_ok=True)
+    PACMAN_HOOK.write_text(
+        "[Trigger]\n"
+        "Operation = Install\n"
+        "Operation = Upgrade\n"
+        "Type = Package\n"
+        "Target = zen-browser-bin\n"
+        "\n"
+        "[Action]\n"
+        "Description = Re-locking DNS-over-HTTPS off for Zen Browser...\n"
+        "When = PostTransaction\n"
+        "Exec = /usr/local/bin/site-blocker doh\n",
+        encoding="utf-8",
+    )
+    print(f"  pacman hook: {PACMAN_HOOK}")
+
+
+def write_systemd() -> None:
+    SERVICE.write_text(
+        "[Unit]\n"
+        "Description=Refresh site-blocker DNS lists\n"
+        "Wants=network-online.target\n"
+        "After=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={SELF} update\n",
+        encoding="utf-8",
+    )
+    TIMER.write_text(
+        "[Unit]\n"
+        "Description=Weekly refresh of site-blocker DNS lists\n"
+        "\n"
+        "[Timer]\n"
+        "OnCalendar=Sun *-*-* 04:30\n"
+        "RandomizedDelaySec=30m\n"
+        "Persistent=true\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", TIMER.name], check=False)
+    print(f"  timer: {TIMER} (weekly)")
+
+
+def setup_nm_dnsmasq() -> None:
+    resolv = Path("/etc/resolv.conf")
+    already = (
+        NM_CONF.exists()
+        and resolv.is_symlink()
+        and os.readlink(resolv) == "/run/NetworkManager/resolv.conf"
+        and subprocess.run(
+            ["systemctl", "is-active", "--quiet", "systemd-resolved"]
+        ).returncode
+        != 0
+    )
+    if already:
+        print(f"  NetworkManager dnsmasq: already configured")
+        return
+
+    NM_CONF.parent.mkdir(parents=True, exist_ok=True)
+    NM_CONF.write_text("[main]\ndns=dnsmasq\n", encoding="utf-8")
+    print(f"  NetworkManager dnsmasq: {NM_CONF}")
+
+    if resolv.is_symlink() and "systemd" in os.readlink(resolv):
+        resolv.unlink()
+    elif resolv.exists() and not resolv.is_symlink():
+        shutil.copy2(resolv, "/etc/resolv.conf.site-blocker-backup")
+        resolv.unlink()
+    target = Path("/run/NetworkManager/resolv.conf")
+    if not resolv.exists():
+        resolv.symlink_to(target)
+
+    subprocess.run(["systemctl", "disable", "--now", "systemd-resolved"], check=False)
+    subprocess.run(["systemctl", "restart", "NetworkManager"], check=False)
+    print("  systemd-resolved disabled; NetworkManager now answers DNS")
+
+
+def reload_dns(gentle: bool = False) -> None:
+    if gentle:
+        # Restart just the DNS plugin so dnsmasq re-reads dnsmasq.d. Falls back
+        # to a full NetworkManager restart if nmcli lacks the flag.
+        res = subprocess.run(
+            ["nmcli", "general", "reload", "dns-full"],
+            capture_output=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            return
+    subprocess.run(["systemctl", "restart", "NetworkManager"], check=False)
+
+
+LOG_FILE = STATE_DIR / "site-blocker.log"
+
+
+def log_event(message: str) -> None:
+    """Record state changes so timer-driven runs can be debugged later."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + message + "\n")
+        if LOG_FILE.stat().st_size > 64 * 1024:
+            lines = LOG_FILE.read_text(encoding="utf-8").splitlines()[-200:]
+            LOG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def dns_is_blocked(domain: str, timeout: float = 2.0) -> bool | None:
+    """Query the local resolver directly; True if it answers NXDOMAIN.
+
+    Bypasses nsswitch caching so it reports what dnsmasq currently serves.
+    """
+    qname = b"".join(bytes([len(p)]) + p.encode() for p in domain.split(".")) + b"\x00"
+    packet = b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + qname + b"\x00\x01\x00\x01"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout)
+        sock.sendto(packet, ("127.0.0.1", 53))
+        reply, _ = sock.recvfrom(2048)
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    if len(reply) < 12:
+        return None
+    return (reply[3] & 0x0F) == 3
+
+
+def wait_dns(blocked: bool, domain: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if dns_is_blocked(domain) == blocked:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def apply_dns(blocked: bool, domain: str) -> None:
+    """Make the resolver serve the requested state, then prove it did.
+
+    `nmcli general reload dns-full` usually restarts dnsmasq, but a run from a
+    transient systemd unit can return success without the child picking up a
+    changed conf-dir. Verify with a direct query and restart NetworkManager
+    when the gentle path did not take effect.
+    """
+    if dns_is_blocked(domain) == blocked:
+        return
+    reload_dns(gentle=True)
+    if wait_dns(blocked, domain, 3.0):
+        log_event(f"dns reloaded: {domain} {'blocked' if blocked else 'allowed'}")
+        return
+    log_event(f"gentle reload failed for {domain}; restarting NetworkManager")
+    subprocess.run(["systemctl", "restart", "NetworkManager"], check=False)
+    if wait_dns(blocked, domain, 20.0):
+        log_event(f"dns after NetworkManager restart: {domain} {'blocked' if blocked else 'allowed'}")
+    else:
+        log_event(f"warning: dns state still wrong for {domain}")
+
+
+def read_pause() -> int | None:
+    """Epoch seconds until which blocking is lifted, or None."""
+    try:
+        data = json.loads(PAUSE_JSON.read_text(encoding="utf-8"))
+        until = int(data.get("until", 0))
+    except (OSError, ValueError, TypeError):
+        return None
+    return until if until > 0 else None
+
+
+def pause_active() -> bool:
+    until = read_pause()
+    return PAUSED_CONF.exists() and until is not None and until > int(time.time())
+
+
+def write_pause_json(until: int, started: int) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PAUSE_JSON.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps({"until": until, "started": started}) + "\n", encoding="utf-8"
+    )
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, PAUSE_JSON)
+
+
+def cancel_resume_timer() -> None:
+    timer = f"{RESUME_UNIT}.timer"
+    service = f"{RESUME_UNIT}.service"
+    # Never stop the service: a timer-fired run calls this from inside that
+    # very service, and stopping it would kill the command mid-way through.
+    subprocess.run(["systemctl", "stop", timer], capture_output=True, check=False)
+    subprocess.run(["systemctl", "reset-failed", timer, service], capture_output=True, check=False)
+
+
+def schedule_resume(seconds: int) -> bool:
+    """Arrange for `site-blocker resume` to run when the window elapses."""
+    cancel_resume_timer()
+    res = subprocess.run(
+        [
+            "systemd-run",
+            "--unit", RESUME_UNIT,
+            "--collect",
+            "--timer-property=AccuracySec=1s",
+            f"--on-active={max(1, int(seconds))}",
+            str(SELF), "resume",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print(
+            "site-blocker: warning: could not schedule auto-resume: "
+            + (res.stderr.strip() or f"exit {res.returncode}"),
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def pause_cleanup() -> None:
+    try:
+        PAUSE_JSON.unlink()
+    except FileNotFoundError:
+        pass
+    cancel_resume_timer()
+
+
+def restore_conf() -> None:
+    """Move the parked blocklist back into dnsmasq.d and clear pause state."""
+    CONF.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(PAUSED_CONF), str(CONF))
+    try:
+        CONF.chmod(0o644)
+    except OSError:
+        pass
+    pause_cleanup()
+
+
+def heal_expired_pause() -> bool:
+    """Restore the blocklist if its pause window has elapsed (missed timer)."""
+    if not PAUSED_CONF.exists():
+        return False
+    until = read_pause()
+    if until is not None and until > int(time.time()):
+        return False
+    restore_conf()
+    return True
+
+
+def test_resolution() -> None:
+    print("\n  resolution check:")
+
+    def lookup(domain: str) -> str:
+        try:
+            res = subprocess.run(
+                ["getent", "ahosts", domain],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+        except subprocess.TimeoutExpired:
+            return "TIMEOUT"
+        if res.returncode != 0 or not res.stdout.strip():
+            return "blocked"
+        first = res.stdout.splitlines()[0].split()[0]
+        if first in ("0.0.0.0", "::"):
+            return "blocked"
+        return "ok"
+
+    for d in (
+        "instagram.com",
+        "www.facebook.com",
+        "poki.com",
+        "youtube.com",
+        "discord.com",
+        "whatsapp.com",
+        "www.pw.live",
+        "google.com",
+    ):
+        print(f"    {d:<22} {lookup(d)}")
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    need_root()
+    ensure_defaults()
+    print("Downloading blocklists:")
+    for name, url in SOURCES:
+        download(name, url)
+    print("\nBuilding blocklist:")
+    build()
+    write_doh_policies()
+    write_pacman_hook()
+    write_systemd()
+    setup_nm_dnsmasq()
+    if not args.no_reload:
+        reload_dns()
+    print("\nDone.")
+
+
+def cmd_apply(args: argparse.Namespace) -> None:
+    need_root()
+    print("Building blocklist from cached lists:")
+    build()
+    if not args.no_reload:
+        reload_dns()
+    print("\nDone.")
+
+
+def cmd_doh(_: argparse.Namespace) -> None:
+    need_root()
+    write_doh_policies()
+
+
+def cmd_pause(args: argparse.Namespace) -> None:
+    need_root()
+    minutes = max(1, min(PAUSE_MAX_MIN, int(args.minutes)))
+    now = int(time.time())
+    until = now + minutes * 60
+
+    already_paused = pause_active()
+    if CONF.exists():
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(CONF), str(PAUSED_CONF))
+    if not PAUSED_CONF.exists():
+        die("no blocklist to park (run: sudo site-blocker update)")
+
+    write_pause_json(until, now)
+    schedule_resume(max(1, until - now))
+    if not already_paused:
+        apply_dns(False, "instagram.com")
+    until_text = time.strftime("%H:%M", time.localtime(until))
+    print(
+        f"site blocking lifted for {minutes} min (until {until_text})"
+        + ("  [extended]" if already_paused else "")
+    )
+
+
+def cmd_resume(_: argparse.Namespace) -> None:
+    need_root()
+    if PAUSED_CONF.exists():
+        restore_conf()
+        apply_dns(True, "instagram.com")
+        print("site blocking resumed")
+    else:
+        pause_cleanup()
+        print("site blocking was not paused")
+
+
+def cmd_paused(_: argparse.Namespace) -> None:
+    until = read_pause()
+    now = int(time.time())
+    if PAUSED_CONF.exists() and until and until > now:
+        until_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
+        print(f"paused until {until_text} ({max(0, until - now) // 60} min remaining)")
+    elif PAUSED_CONF.exists():
+        print("paused (window elapsed; restores on next apply, update or resume)")
+    else:
+        print("active")
+
+
+
+def cmd_heal(_: argparse.Namespace) -> None:
+    """Repair an expired reward pause left by a reboot or a missed timer."""
+    need_root()
+    healed = []
+    if heal_expired_pause():
+        apply_dns(True, "instagram.com")
+        log_event("healed expired site-blocker pause window")
+        healed.append("site blocking")
+    if healed:
+        print("Restored: " + ", ".join(healed))
+    else:
+        print("No expired allow windows")
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    live = CONF if CONF.exists() else PAUSED_CONF
+    if not live.exists():
+        die("not installed (no blocklist config found)")
+    count = 0
+    with live.open(encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            if line.startswith("local=/"):
+                count += 1
+    mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(live.stat().st_mtime))
+    print(f"Blocked domains : {count:,}")
+    print(f"List generated  : {mtime}")
+    print(f"Config file     : {live}")
+    print(f"Allow list      : {ALLOW_FILE} ({len(read_lines(ALLOW_FILE))} entries)")
+    print(f"Extra blocklist : {EXTRA_FILE} ({len(read_lines(EXTRA_FILE))} entries)")
+    try:
+        print(f"resolv.conf     : {os.readlink('/etc/resolv.conf')}")
+    except OSError:
+        print("resolv.conf     : regular file")
+    print(f"systemd-resolved: {subprocess.run(['systemctl', 'is-active', 'systemd-resolved'], capture_output=True, text=True).stdout.strip()}")
+    print(f"timer           : {subprocess.run(['systemctl', 'is-active', 'site-blocker.timer'], capture_output=True, text=True).stdout.strip()}")
+    until = read_pause()
+    if PAUSED_CONF.exists():
+        if until and until > int(time.time()):
+            print(f"pause           : lifted until {time.strftime('%Y-%m-%d %H:%M', time.localtime(until))}")
+        else:
+            print("pause           : conf parked (window elapsed)")
+    else:
+        print("pause           : not paused")
+    test_resolution()
+
+
+def cmd_allow(args: argparse.Namespace) -> None:
+    need_root()
+    ensure_defaults()
+    additions = []
+    for raw in args.domains:
+        d = raw.strip().lower().lstrip("*.").rstrip(".")
+        if not valid_domain(d):
+            die(f"invalid domain: {raw}")
+        additions.append(d)
+    with ALLOW_FILE.open("a", encoding="utf-8") as fh:
+        if ALLOW_FILE.stat().st_size and not ALLOW_FILE.read_text(encoding="utf-8").endswith("\n"):
+            fh.write("\n")
+        fh.write(f"\n# added {time.strftime('%Y-%m-%d')}\n")
+        for d in additions:
+            fh.write(d + "\n")
+    print(f"Allowed: {', '.join(additions)}")
+    cmd_apply(argparse.Namespace(no_reload=False))
+
+
+def cmd_block(args: argparse.Namespace) -> None:
+    need_root()
+    ensure_defaults()
+    additions = []
+    for raw in args.domains:
+        d = raw.strip().lower().lstrip("*.").rstrip(".")
+        if not valid_domain(d):
+            die(f"invalid domain: {raw}")
+        additions.append(d)
+    with EXTRA_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n# added {time.strftime('%Y-%m-%d')}\n")
+        for d in additions:
+            fh.write(d + "\n")
+    print(f"Blocked: {', '.join(additions)}")
+    cmd_apply(argparse.Namespace(no_reload=False))
+
+
+def cmd_uninstall(_: argparse.Namespace) -> None:
+    need_root()
+    print("Removing site-blocker ...")
+    subprocess.run(["systemctl", "disable", "--now", TIMER.name], check=False)
+    cancel_resume_timer()
+    for p in (
+        TIMER,
+        SERVICE,
+        NM_CONF,
+        CONF,
+        PAUSED_CONF,
+        PAUSE_JSON,
+        SAFESEARCH_CONF,
+        PACMAN_HOOK,
+        FIREFOX_POLICY,
+    ):
+        try:
+            p.unlink()
+            print(f"  removed {p}")
+        except FileNotFoundError:
+            pass
+
+    # Remove our DoH policy from the packaged Zen file, keep other policies.
+    if ZEN_POLICY.exists():
+        try:
+            data = json.loads(ZEN_POLICY.read_text(encoding="utf-8"))
+            data.get("policies", {}).pop("DNSOverHTTPS", None)
+            ZEN_POLICY.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            print(f"  cleaned {ZEN_POLICY}")
+        except (ValueError, OSError):
+            pass
+
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "unmask", "systemd-resolved.service"], check=False)
+    subprocess.run(
+        [
+            "systemctl",
+            "enable",
+            "--now",
+            "systemd-resolved.service",
+            "systemd-resolved-monitor.socket",
+            "systemd-resolved-varlink.socket",
+        ],
+        check=False,
+    )
+    resolv = Path("/etc/resolv.conf")
+    try:
+        resolv.unlink()
+    except FileNotFoundError:
+        pass
+    backup = Path("/etc/resolv.conf.site-blocker-backup")
+    if backup.exists():
+        shutil.move(str(backup), resolv)
+    else:
+        resolv.symlink_to("/run/systemd/resolve/stub-resolv.conf")
+    subprocess.run(["systemctl", "restart", "NetworkManager"], check=False)
+    print("Done. DNS restored to systemd-resolved.")
+    print(f"Left in place: {ALLOW_FILE}, {EXTRA_FILE}, {STATE_DIR}, {SELF}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="site-blocker", description="System-wide DNS distraction blocker"
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("update", help="download lists, rebuild, reload DNS")
+    p.add_argument("--no-reload", action="store_true")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("apply", help="rebuild from cached lists")
+    p.add_argument("--no-reload", action="store_true")
+    p.set_defaults(func=cmd_apply)
+
+    p = sub.add_parser("pause", help="lift blocking for N minutes (default 120)")
+    p.add_argument("minutes", nargs="?", type=int, default=PAUSE_DEFAULT_MIN)
+    p.set_defaults(func=cmd_pause)
+
+    p = sub.add_parser("resume", help="restore blocking now")
+    p.set_defaults(func=cmd_resume)
+
+    p = sub.add_parser("paused", help="show pause state")
+    p.set_defaults(func=cmd_paused)
+
+    p = sub.add_parser("heal", help="restore expired allow windows (boot watchdog)")
+    p.set_defaults(func=cmd_heal)
+
+    p = sub.add_parser("doh", help="(re)apply browser DoH lock")
+    p.set_defaults(func=cmd_doh)
+
+    p = sub.add_parser("status", help="show status and test domains")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("allow", help="allow domains")
+    p.add_argument("domains", nargs="+")
+    p.set_defaults(func=cmd_allow)
+
+    p = sub.add_parser("block", help="block extra domains")
+    p.add_argument("domains", nargs="+")
+    p.set_defaults(func=cmd_block)
+
+    p = sub.add_parser("uninstall", help="remove and restore DNS")
+    p.set_defaults(func=cmd_uninstall)
+
+    parser.set_defaults(func=cmd_update)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
