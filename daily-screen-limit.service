@@ -1,0 +1,7 @@
+[Unit]
+Description=Daily screen-time limiter tick
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/daily-screen-limit

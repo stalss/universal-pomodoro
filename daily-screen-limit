@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Daily screen-time limiter.
+
+Counts the time this desktop session is unlocked, warns 15 minutes before the
+limit, and ends the session when the limit is reached. Logging in again later
+the same day immediately ends the session; the counter resets at local
+midnight. The limit is read from the pomodoro widget's `dailyLimitMinutes`
+setting in shell.json, clamped to 5..360 minutes (default 180).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
+SHELL_CONFIG = CONFIG_HOME / "omarchy/shell.json"
+STATE_FILE = STATE_HOME / "omarchy/daily-screen-limit.json"
+DEFAULT_MINUTES = 180
+MIN_MINUTES = 5
+MAX_MINUTES = 360
+WARN_SECONDS = 15 * 60
+MAX_TICK_SECONDS = 120  # suspend/resume must not burn the whole allowance
+
+
+def read_limit_minutes() -> int:
+    try:
+        data = json.loads(SHELL_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return DEFAULT_MINUTES
+    found: object = None
+
+    def walk(node: object) -> None:
+        nonlocal found
+        if found is not None:
+            return
+        if isinstance(node, dict):
+            if node.get("id") == "larper.pomodoro" and "dailyLimitMinutes" in node:
+                found = node["dailyLimitMinutes"]
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(data)
+    try:
+        minutes = int(found)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_MINUTES
+    return max(MIN_MINUTES, min(MAX_MINUTES, minutes))
+
+
+def session_id() -> str | None:
+    sid = os.environ.get("XDG_SESSION_ID", "").strip()
+    if sid.isdigit():
+        return sid
+    try:
+        out = subprocess.run(
+            ["loginctl", "list-sessions", "--no-legend"],
+            capture_output=True, text=True, check=False,
+        ).stdout
+    except OSError:
+        return None
+    for line in out.splitlines():
+        candidate = line.split()[0] if line.split() else ""
+        if not candidate.isdigit():
+            continue
+        info = subprocess.run(
+            ["loginctl", "show-session", candidate, "-p", "Class", "-p", "Active", "--value"],
+            capture_output=True, text=True, check=False,
+        ).stdout.split()
+        if "user" in info and "yes" in info:
+            return candidate
+    return None
+
+
+def locked_hint(sid: str) -> bool | None:
+    try:
+        res = subprocess.run(
+            ["loginctl", "show-session", sid, "-p", "LockedHint", "--value"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return None
+    value = res.stdout.strip().lower()
+    if res.returncode == 0 and value == "yes":
+        return True
+    if res.returncode == 0 and value == "no":
+        return False
+    return None
+
+
+def notify(title: str, message: str) -> None:
+    subprocess.run(
+        ["notify-send", "-a", "Daily screen limit", title, message],
+        capture_output=True, check=False,
+    )
+
+
+def today() -> str:
+    return dt.datetime.now().astimezone().strftime("%Y-%m-%d")
+
+
+def load_state() -> dict:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict) or data.get("date") != today():
+        return {"date": today(), "seconds": 0, "warned": False, "last": int(time.time())}
+    last = data.get("last")
+    return {
+        "date": today(),
+        "seconds": max(0, int(data.get("seconds", 0) or 0)),
+        "warned": bool(data.get("warned", False)),
+        "last": last if isinstance(last, (int, float)) else int(time.time()),
+    }
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def clock(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true", help="do not end the session")
+    parser.add_argument("--status", action="store_true", help="print today's usage")
+    parser.add_argument("--reset", action="store_true", help="clear today's counter")
+    args = parser.parse_args()
+
+    state = load_state()
+    limit = read_limit_minutes() * 60
+
+    if args.reset:
+        save_state({"date": today(), "seconds": 0, "warned": False, "last": int(time.time())})
+        print("Counter reset")
+        return
+
+    sid = session_id()
+    locked = locked_hint(sid) if sid else None
+    remaining = limit - state["seconds"]
+
+    if args.status:
+        print(
+            f"date={state['date']} used={clock(state['seconds'])} "
+            f"limit={clock(limit)} remaining={clock(remaining)} "
+            f"locked={locked} session={sid or 'none'}"
+        )
+        return
+
+    now = int(time.time())
+    if locked is None:
+        # Unknown lock state: never count and never log out on bad data.
+        state["last"] = now
+        save_state(state)
+        print("Lock state unavailable; skipping this tick")
+        return
+
+    if not locked:
+        last = state.get("last")
+        if isinstance(last, (int, float)):
+            delta = max(0, min(now - int(last), MAX_TICK_SECONDS))
+            state["seconds"] += delta
+    state["last"] = now
+    remaining = limit - state["seconds"]
+
+    if remaining <= 0:
+        if args.dry_run:
+            print(f"DRY RUN: would end session {sid} (used {clock(state['seconds'])})")
+        elif sid:
+            notify("Daily limit reached", "Signing out now. The limit resets at midnight.")
+            time.sleep(2)
+            subprocess.run(["loginctl", "terminate-session", sid], check=False)
+            print(f"Session {sid} terminated at {clock(state['seconds'])}")
+    elif remaining <= WARN_SECONDS and not state["warned"]:
+        notify("15 minutes left", "You will be signed out when the daily limit is reached.")
+        state["warned"] = True
+        print(f"Warning sent; {clock(remaining)} left")
+
+    save_state(state)
+    if remaining > WARN_SECONDS:
+        print(f"Used {clock(state['seconds'])} of {clock(limit)}")
+
+
+if __name__ == "__main__":
+    main()
